@@ -25,7 +25,6 @@ const userSchema = new mongoose.Schema(
     password: {
       type: String,
       required: true,
-      minlength: 6,
     },
 
     role: {
@@ -39,12 +38,20 @@ const userSchema = new mongoose.Schema(
       default: "",
       trim: true,
     },
+
+    services: {
+      type: [String],
+      default: [],
+    },
+
+    rating: {
+      type: Number,
+      default: 0,
+    },
   },
   {
     timestamps: true,
   },
 );
 
-const User = mongoose.model("User", userSchema);
-
-module.exports = User;
+module.exports = mongoose.model("User", userSchema);
