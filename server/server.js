@@ -5,14 +5,30 @@ const dotenv = require("dotenv");
 const connectDB = require("./config/db");
 
 const authRoutes = require("./routes/authRoutes");
+
 const taskRoutes = require("./routes/taskRoutes");
+
+const messageRoutes = require("./routes/messageRoutes");
 
 dotenv.config();
 
 const app = express();
 
+/*
+========================================
+MIDDLEWARE
+========================================
+*/
+
 app.use(cors());
+
 app.use(express.json());
+
+/*
+========================================
+HEALTH CHECK
+========================================
+*/
 
 app.get("/", (req, res) => {
   res.json({
@@ -21,10 +37,31 @@ app.get("/", (req, res) => {
   });
 });
 
+/*
+========================================
+ROUTES
+========================================
+*/
+
 app.use("/api/auth", authRoutes);
+
 app.use("/api/tasks", taskRoutes);
 
+app.use("/api/messages", messageRoutes);
+
+/*
+========================================
+PORT
+========================================
+*/
+
 const PORT = process.env.PORT || 5000;
+
+/*
+========================================
+START SERVER
+========================================
+*/
 
 const startServer = async () => {
   try {

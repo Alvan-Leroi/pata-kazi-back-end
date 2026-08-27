@@ -189,11 +189,19 @@ router.get("/provider/my-jobs", protect, async (req, res) => {
       });
     }
 
+    /*
+      Only show ACTIVE jobs here.
+
+      Completed jobs will no longer
+      appear in the active provider
+      dashboard.
+      */
+
     const tasks = await Task.find({
       assignedProviderId: req.userId,
 
       status: {
-        $in: ["assigned", "in-progress", "completed"],
+        $in: ["assigned", "in-progress"],
       },
     })
       .populate("customerId", "fullName location")
@@ -202,9 +210,8 @@ router.get("/provider/my-jobs", protect, async (req, res) => {
       });
 
     /*
-      Find the accepted offer for
-      each assigned task so we can
-      return the agreed price too.
+      Add accepted offer information
+      so provider sees agreed price.
       */
 
     const jobsWithOffers = await Promise.all(
@@ -249,6 +256,7 @@ router.get("/provider/my-jobs", protect, async (req, res) => {
 ========================================
 SEND OFFER
 POST /api/tasks/:taskId/offers
+PROVIDER ONLY
 ========================================
 */
 
@@ -516,7 +524,7 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
     }
 
     /*
-      Accept winning offer
+      ACCEPT WINNING OFFER
       */
 
     offer.status = "accepted";
@@ -524,7 +532,7 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
     await offer.save();
 
     /*
-      Assign provider to task
+      ASSIGN PROVIDER
       */
 
     task.assignedProviderId = offer.providerId;
@@ -534,7 +542,7 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
     await task.save();
 
     /*
-      Decline competing offers
+      DECLINE OTHER OFFERS
       */
 
     await Offer.updateMany(
@@ -641,8 +649,77 @@ router.get("/:taskId/providers", protect, async (req, res) => {
 
 /*
 ========================================
+CUSTOMER - MARK JOB COMPLETE
+PATCH /api/tasks/:taskId/complete
+========================================
+*/
+
+router.patch("/:taskId/complete", protect, async (req, res) => {
+  try {
+    const customer = await User.findById(req.userId);
+
+    if (!customer) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    if (customer.role !== "customer") {
+      return res.status(403).json({
+        message: "Only the customer can complete this job.",
+      });
+    }
+
+    const task = await Task.findById(req.params.taskId);
+
+    if (!task) {
+      return res.status(404).json({
+        message: "Task not found.",
+      });
+    }
+
+    if (task.customerId.toString() !== req.userId.toString()) {
+      return res.status(403).json({
+        message: "You are not authorized to complete this task.",
+      });
+    }
+
+    if (!["assigned", "in-progress"].includes(task.status)) {
+      return res.status(400).json({
+        message: "Only an active job can be completed.",
+      });
+    }
+
+    /*
+      MARK COMPLETE
+      */
+
+    task.status = "completed";
+
+    await task.save();
+
+    return res.status(200).json({
+      success: true,
+
+      message: "Job marked as completed.",
+
+      task,
+    });
+  } catch (error) {
+    console.error("Complete task error:", error);
+
+    return res.status(500).json({
+      message: "Server error while completing the job.",
+    });
+  }
+});
+
+/*
+========================================
 GET ONE TASK
 GET /api/tasks/:taskId
+
+KEEP THIS GENERIC ROUTE LAST
 ========================================
 */
 
@@ -673,9 +750,19 @@ router.get("/:taskId", protect, async (req, res) => {
     if (user.role === "provider") {
       const assignedProviderId = task.assignedProviderId?._id?.toString();
 
+      /*
+        Any provider can see
+        an OPEN job.
+        */
+
       if (task.status === "open") {
         return res.status(200).json(task);
       }
+
+      /*
+        Once assigned, only the
+        chosen provider can see it.
+        */
 
       if (assignedProviderId === req.userId.toString()) {
         return res.status(200).json(task);
@@ -707,6 +794,12 @@ router.get("/:taskId", protect, async (req, res) => {
     });
   } catch (error) {
     console.error("Load task error:", error);
+
+    if (error.name === "CastError") {
+      return res.status(404).json({
+        message: "Job not found.",
+      });
+    }
 
     return res.status(500).json({
       message: "Server error while loading job.",
