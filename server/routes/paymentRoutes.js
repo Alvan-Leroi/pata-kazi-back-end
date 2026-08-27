@@ -23,26 +23,6 @@ const getMpesaBaseUrl = () => {
   return "https://sandbox.safaricom.co.ke";
 };
 
-/*
-========================================
-NORMALIZE KENYAN PHONE NUMBER
-
-Examples:
-
-0712345678
-    ↓
-254712345678
-
-+254712345678
-    ↓
-254712345678
-
-254712345678
-    ↓
-254712345678
-========================================
-*/
-
 const normalizePhoneNumber = (phoneNumber) => {
   if (!phoneNumber) {
     return null;
@@ -73,13 +53,6 @@ const normalizePhoneNumber = (phoneNumber) => {
   return clean;
 };
 
-/*
-========================================
-CREATE M-PESA TIMESTAMP
-YYYYMMDDHHMMSS
-========================================
-*/
-
 const createTimestamp = () => {
   const now = new Date();
 
@@ -94,12 +67,6 @@ const createTimestamp = () => {
     pad(now.getSeconds())
   );
 };
-
-/*
-========================================
-GET M-PESA ACCESS TOKEN
-========================================
-*/
 
 const getMpesaAccessToken = async () => {
   const consumerKey = process.env.MPESA_CONSUMER_KEY;
@@ -152,18 +119,12 @@ const getMpesaAccessToken = async () => {
   return data.access_token;
 };
 
-/*
-========================================
-CALLBACK METADATA HELPER
-========================================
-*/
-
 const getCallbackMetadata = (callback) => {
-  const metadataItems = callback?.CallbackMetadata?.Item || [];
+  const items = callback?.CallbackMetadata?.Item || [];
 
   const result = {};
 
-  metadataItems.forEach((item) => {
+  items.forEach((item) => {
     if (item?.Name) {
       result[item.Name] = item.Value;
     }
@@ -174,19 +135,27 @@ const getCallbackMetadata = (callback) => {
 
 /*
 ========================================
-START M-PESA STK PUSH
+REQUEST CUSTOMER PAYMENT
 
 POST
 /api/payments/mpesa/stk-push
 
-IMPORTANT:
+IMPORTANT FLOW:
 
-We DO NOT trust a provider phone
-or random client-side account value.
+Logged-in user:
+PROVIDER
 
-We load the currently authenticated
-CUSTOMER from MongoDB and use that
-customer's saved phone number.
+STK recipient:
+CUSTOMER
+
+The provider initiates the payment
+request.
+
+The backend fetches the customer's
+phone number from MongoDB.
+
+The provider never types or controls
+the customer's phone number.
 ========================================
 */
 
@@ -204,46 +173,34 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     /*
       ========================================
-      LOAD LOGGED-IN CUSTOMER
+      LOAD PROVIDER
       ========================================
       */
 
-    const customer = await User.findById(req.userId);
+    const provider = await User.findById(req.userId);
 
-    if (!customer) {
+    if (!provider) {
       return res.status(404).json({
-        message: "Customer account could not be found.",
+        message: "Provider account could not be found.",
       });
     }
 
-    if (customer.role !== "customer") {
+    if (provider.role !== "provider") {
       return res.status(403).json({
-        message: "Only customers can make payments.",
+        message: "Only service providers can request payment.",
       });
     }
 
     /*
       ========================================
-      CUSTOMER PHONE NUMBER
+      LOAD TASK + CUSTOMER
       ========================================
       */
 
-    const normalizedPhone = normalizePhoneNumber(customer.phone);
-
-    if (!normalizedPhone) {
-      return res.status(400).json({
-        message:
-          "Your Pata Kazi account does not have a valid Kenyan phone number. Please update your customer phone number before paying.",
-      });
-    }
-
-    /*
-      ========================================
-      LOAD TASK
-      ========================================
-      */
-
-    const task = await Task.findById(taskId);
+    const task = await Task.findById(taskId).populate(
+      "customerId",
+      "fullName phone email role",
+    );
 
     if (!task) {
       return res.status(404).json({
@@ -253,13 +210,19 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     /*
       ========================================
-      VERIFY CUSTOMER OWNS TASK
+      VERIFY PROVIDER IS ASSIGNED
       ========================================
       */
 
-    if (task.customerId.toString() !== customer._id.toString()) {
+    if (!task.assignedProviderId) {
+      return res.status(400).json({
+        message: "No provider has been assigned to this task.",
+      });
+    }
+
+    if (task.assignedProviderId.toString() !== provider._id.toString()) {
       return res.status(403).json({
-        message: "You are not authorized to pay for this task.",
+        message: "You are not the assigned provider for this task.",
       });
     }
 
@@ -271,19 +234,30 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     if (!["assigned", "in-progress"].includes(task.status)) {
       return res.status(400).json({
-        message: "Payment is only available for an assigned active job.",
+        message: "Payment can only be requested for an active assigned job.",
       });
     }
 
     /*
       ========================================
-      VERIFY PROVIDER EXISTS
+      GET CUSTOMER
       ========================================
       */
 
-    if (!task.assignedProviderId) {
+    const customer = task.customerId;
+
+    if (!customer) {
+      return res.status(404).json({
+        message: "Customer account could not be found.",
+      });
+    }
+
+    const customerPhone = normalizePhoneNumber(customer.phone);
+
+    if (!customerPhone) {
       return res.status(400).json({
-        message: "No provider has been assigned to this task.",
+        message:
+          "The customer does not have a valid Kenyan phone number saved.",
       });
     }
 
@@ -296,22 +270,16 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
     const acceptedOffer = await Offer.findOne({
       taskId: task._id,
 
-      providerId: task.assignedProviderId,
+      providerId: provider._id,
 
       status: "accepted",
     });
 
     if (!acceptedOffer) {
       return res.status(400).json({
-        message: "Accepted provider offer could not be found.",
+        message: "Accepted offer could not be found.",
       });
     }
-
-    /*
-      ========================================
-      USE ACCEPTED OFFER PRICE
-      ========================================
-      */
 
     const amount = Math.round(Number(acceptedOffer.amount));
 
@@ -341,7 +309,25 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     /*
       ========================================
-      CREATE LOCAL PAYMENT
+      PREVENT MULTIPLE ACTIVE STK REQUESTS
+      ========================================
+      */
+
+    const existingPendingPayment = await Payment.findOne({
+      taskId: task._id,
+
+      status: "pending",
+    });
+
+    if (existingPendingPayment) {
+      return res.status(400).json({
+        message: "A payment request is already pending for this task.",
+      });
+    }
+
+    /*
+      ========================================
+      CREATE PAYMENT
       ========================================
       */
 
@@ -350,22 +336,18 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
       customerId: customer._id,
 
-      providerId: task.assignedProviderId,
+      providerId: provider._id,
 
       amount,
 
-      /*
-          THIS IS THE CUSTOMER NUMBER
-          */
-
-      phoneNumber: normalizedPhone,
+      phoneNumber: customerPhone,
 
       status: "pending",
     });
 
     /*
       ========================================
-      M-PESA ENVIRONMENT
+      M-PESA SETTINGS
       ========================================
       */
 
@@ -379,46 +361,24 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       throw new Error("M-PESA shortcode, passkey, or callback URL is missing.");
     }
 
-    /*
-      ========================================
-      CREATE PASSWORD
-      ========================================
-      */
-
     const timestamp = createTimestamp();
 
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString(
       "base64",
     );
 
-    /*
-      ========================================
-      ACCESS TOKEN
-      ========================================
-      */
-
     const accessToken = await getMpesaAccessToken();
 
     const baseUrl = getMpesaBaseUrl();
-
-    /*
-      ========================================
-      ACCOUNT REFERENCE
-      ========================================
-      */
 
     const accountReference = `PK-${task._id.toString().slice(-8)}`;
 
     /*
       ========================================
-      M-PESA REQUEST
-      ========================================
+      STK PUSH
 
-      PartyA       = CUSTOMER
-      PhoneNumber  = CUSTOMER
-      PartyB       = BUSINESS SHORTCODE
-
-      Provider number is NOT used here.
+      CUSTOMER receives prompt.
+      PROVIDER initiated request.
       ========================================
       */
 
@@ -433,11 +393,11 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
       Amount: amount,
 
-      PartyA: normalizedPhone,
+      PartyA: customerPhone,
 
       PartyB: shortcode,
 
-      PhoneNumber: normalizedPhone,
+      PhoneNumber: customerPhone,
 
       CallBackURL: callbackUrl,
 
@@ -446,27 +406,20 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       TransactionDesc: "Pata Kazi service payment",
     };
 
-    /*
-      Safe debug information.
-
-      We log whose payment it is
-      without exposing credentials.
-      */
-
-    console.log("Sending M-PESA STK Push:", {
+    console.log("Provider requesting M-PESA payment:", {
       taskId: task._id.toString(),
+
+      providerId: provider._id.toString(),
+
+      providerName: provider.fullName,
 
       customerId: customer._id.toString(),
 
       customerName: customer.fullName,
 
-      customerPhone: normalizedPhone,
-
-      providerId: task.assignedProviderId.toString(),
+      customerPhone,
 
       amount,
-
-      accountReference,
     });
 
     const mpesaResponse = await fetch(
@@ -496,12 +449,6 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     console.log("M-PESA STK Push response:", mpesaData);
 
-    /*
-      ========================================
-      HANDLE REJECTION
-      ========================================
-      */
-
     if (!mpesaResponse.ok || mpesaData.ResponseCode !== "0") {
       createdPayment.status = "failed";
 
@@ -514,44 +461,80 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
       return res.status(400).json({
         message: createdPayment.resultDescription,
-
-        payment: createdPayment,
       });
     }
-
-    /*
-      ========================================
-      SAVE M-PESA IDS
-      ========================================
-      */
 
     createdPayment.merchantRequestId = mpesaData.MerchantRequestID || "";
 
     createdPayment.checkoutRequestId = mpesaData.CheckoutRequestID || "";
 
     createdPayment.resultDescription =
-      mpesaData.ResponseDescription || "STK Push sent.";
+      mpesaData.ResponseDescription || "Payment request sent.";
 
     await createdPayment.save();
 
     /*
       ========================================
-      RESPONSE TO FRONTEND
+      SOCKET NOTIFICATIONS
       ========================================
       */
+
+    const io = req.app.get("io");
+
+    if (io) {
+      /*
+        Tell customer that provider
+        requested payment.
+        */
+
+      io.to(`user:${customer._id}`).emit("payment_requested", {
+        paymentId: createdPayment._id,
+
+        taskId: task._id,
+
+        providerId: provider._id,
+
+        providerName: provider.fullName,
+
+        amount,
+
+        status: "pending",
+      });
+
+      /*
+        Provider receives confirmation
+        that request was sent.
+        */
+
+      io.to(`user:${provider._id}`).emit("payment_request_sent", {
+        paymentId: createdPayment._id,
+
+        taskId: task._id,
+
+        customerName: customer.fullName,
+
+        amount,
+
+        status: "pending",
+      });
+    }
 
     return res.status(200).json({
       success: true,
 
-      message: "M-PESA payment request sent to your phone.",
+      message: "Payment request sent to the customer.",
 
       paymentId: createdPayment._id,
 
       checkoutRequestId: createdPayment.checkoutRequestId,
 
-      amount: createdPayment.amount,
+      amount,
 
-      phoneNumber: createdPayment.phoneNumber,
+      customerName: customer.fullName,
+
+      customerPhone: customerPhone,
+
+      status: createdPayment.status,
     });
   } catch (error) {
     console.error("M-PESA STK Push error:", error);
@@ -565,7 +548,7 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
     }
 
     return res.status(500).json({
-      message: error.message || "Server error while initiating M-PESA payment.",
+      message: error.message || "Server error while requesting payment.",
     });
   }
 });
@@ -576,11 +559,6 @@ M-PESA CALLBACK
 
 POST
 /api/payments/mpesa/callback
-
-NO JWT AUTH HERE.
-
-Safaricom needs public access
-to this URL.
 ========================================
 */
 
@@ -593,8 +571,6 @@ router.post("/mpesa/callback", async (req, res) => {
     const callback = req.body?.Body?.stkCallback;
 
     if (!callback) {
-      console.warn("Invalid M-PESA callback body.");
-
       return res.status(200).json({
         ResultCode: 0,
 
@@ -610,12 +586,6 @@ router.post("/mpesa/callback", async (req, res) => {
 
     const resultDescription = callback.ResultDesc || "";
 
-    /*
-      ========================================
-      FIND PAYMENT
-      ========================================
-      */
-
     const payment = await Payment.findOne({
       $or: [
         {
@@ -629,11 +599,7 @@ router.post("/mpesa/callback", async (req, res) => {
     });
 
     if (!payment) {
-      console.warn("No local payment matched callback:", {
-        checkoutRequestId,
-
-        merchantRequestId,
-      });
+      console.warn("No local payment matched callback.");
 
       return res.status(200).json({
         ResultCode: 0,
@@ -647,12 +613,6 @@ router.post("/mpesa/callback", async (req, res) => {
     payment.resultDescription = resultDescription;
 
     payment.rawCallback = req.body;
-
-    /*
-      ========================================
-      SUCCESS
-      ========================================
-      */
 
     if (resultCode === 0) {
       const metadata = getCallbackMetadata(callback);
@@ -672,41 +632,36 @@ router.post("/mpesa/callback", async (req, res) => {
       if (metadata.PhoneNumber) {
         payment.phoneNumber = String(metadata.PhoneNumber);
       }
-
-      console.log(`Payment ${payment._id} marked PAID`);
     } else {
-      /*
-        Result 1032 is commonly
-        customer cancellation.
-        */
-
       payment.status = resultCode === 1032 ? "cancelled" : "failed";
-
-      console.log(`Payment ${payment._id} marked ${payment.status}`);
     }
 
     await payment.save();
 
     /*
       ========================================
-      REAL-TIME PAYMENT EVENT
+      NOTIFY BOTH CUSTOMER + PROVIDER
       ========================================
       */
 
     const io = req.app.get("io");
 
+    const update = {
+      paymentId: payment._id,
+
+      taskId: payment.taskId,
+
+      status: payment.status,
+
+      amount: payment.amount,
+
+      mpesaReceiptNumber: payment.mpesaReceiptNumber,
+    };
+
     if (io) {
-      io.to(`user:${payment.customerId}`).emit("payment_updated", {
-        paymentId: payment._id,
+      io.to(`user:${payment.customerId}`).emit("payment_updated", update);
 
-        taskId: payment.taskId,
-
-        status: payment.status,
-
-        amount: payment.amount,
-
-        mpesaReceiptNumber: payment.mpesaReceiptNumber,
-      });
+      io.to(`user:${payment.providerId}`).emit("payment_updated", update);
     }
 
     return res.status(200).json({
