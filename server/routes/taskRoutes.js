@@ -56,16 +56,23 @@ router.post("/", protect, async (req, res) => {
 
     const task = await Task.create({
       customerId: req.userId,
+
       title: title.trim(),
+
       category: category.trim(),
+
       description: description.trim(),
+
       location: location.trim(),
+
       budget: numericBudget,
     });
 
     return res.status(201).json({
       success: true,
+
       message: "Task created successfully.",
+
       task,
     });
   } catch (error) {
@@ -79,23 +86,22 @@ router.post("/", protect, async (req, res) => {
 
 /*
 ========================================
-GET CUSTOMER'S TASKS
+CUSTOMER - MY TASKS
 GET /api/tasks/mine
-CUSTOMER ONLY
 ========================================
 */
 
 router.get("/mine", protect, async (req, res) => {
   try {
-    const user = await User.findById(req.userId);
+    const customer = await User.findById(req.userId);
 
-    if (!user) {
+    if (!customer) {
       return res.status(404).json({
         message: "User not found.",
       });
     }
 
-    if (user.role !== "customer") {
+    if (customer.role !== "customer") {
       return res.status(403).json({
         message: "Only customers can view posted tasks.",
       });
@@ -103,9 +109,11 @@ router.get("/mine", protect, async (req, res) => {
 
     const tasks = await Task.find({
       customerId: req.userId,
-    }).sort({
-      createdAt: -1,
-    });
+    })
+      .populate("assignedProviderId", "fullName location services rating")
+      .sort({
+        createdAt: -1,
+      });
 
     return res.status(200).json(tasks);
   } catch (error) {
@@ -119,9 +127,8 @@ router.get("/mine", protect, async (req, res) => {
 
 /*
 ========================================
-GET OPEN JOBS
+PROVIDER - OPEN JOBS
 GET /api/tasks/open
-PROVIDER ONLY
 ========================================
 */
 
@@ -161,9 +168,87 @@ router.get("/open", protect, async (req, res) => {
 
 /*
 ========================================
+PROVIDER - MY ASSIGNED JOBS
+GET /api/tasks/provider/my-jobs
+========================================
+*/
+
+router.get("/provider/my-jobs", protect, async (req, res) => {
+  try {
+    const provider = await User.findById(req.userId);
+
+    if (!provider) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    if (provider.role !== "provider") {
+      return res.status(403).json({
+        message: "Only service providers can view provider jobs.",
+      });
+    }
+
+    const tasks = await Task.find({
+      assignedProviderId: req.userId,
+
+      status: {
+        $in: ["assigned", "in-progress", "completed"],
+      },
+    })
+      .populate("customerId", "fullName location")
+      .sort({
+        updatedAt: -1,
+      });
+
+    /*
+      Find the accepted offer for
+      each assigned task so we can
+      return the agreed price too.
+      */
+
+    const jobsWithOffers = await Promise.all(
+      tasks.map(async (task) => {
+        const acceptedOffer = await Offer.findOne({
+          taskId: task._id,
+
+          providerId: req.userId,
+
+          status: "accepted",
+        });
+
+        return {
+          ...task.toObject(),
+
+          acceptedOffer: acceptedOffer
+            ? {
+                _id: acceptedOffer._id,
+
+                amount: acceptedOffer.amount,
+
+                message: acceptedOffer.message,
+
+                status: acceptedOffer.status,
+              }
+            : null,
+        };
+      }),
+    );
+
+    return res.status(200).json(jobsWithOffers);
+  } catch (error) {
+    console.error("Load provider jobs error:", error);
+
+    return res.status(500).json({
+      message: "Server error while loading your jobs.",
+    });
+  }
+});
+
+/*
+========================================
 SEND OFFER
 POST /api/tasks/:taskId/offers
-PROVIDER ONLY
 ========================================
 */
 
@@ -215,12 +300,14 @@ router.post("/:taskId/offers", protect, async (req, res) => {
 
     const existingOffer = await Offer.findOne({
       taskId: task._id,
+
       providerId: req.userId,
     });
 
     if (existingOffer) {
       return res.status(400).json({
         message: "You have already sent an offer for this job.",
+
         offer: existingOffer,
       });
     }
@@ -265,9 +352,8 @@ router.post("/:taskId/offers", protect, async (req, res) => {
 
 /*
 ========================================
-GET PROVIDER'S OFFER
+PROVIDER - MY OFFER
 GET /api/tasks/:taskId/my-offer
-PROVIDER ONLY
 ========================================
 */
 
@@ -295,6 +381,7 @@ router.get("/:taskId/my-offer", protect, async (req, res) => {
 
     return res.status(200).json({
       hasOffer: !!offer,
+
       offer: offer || null,
     });
   } catch (error) {
@@ -308,9 +395,8 @@ router.get("/:taskId/my-offer", protect, async (req, res) => {
 
 /*
 ========================================
-GET OFFERS FOR CUSTOMER TASK
+CUSTOMER - GET OFFERS
 GET /api/tasks/:taskId/offers
-CUSTOMER OWNER ONLY
 ========================================
 */
 
@@ -354,7 +440,9 @@ router.get("/:taskId/offers", protect, async (req, res) => {
 
     return res.status(200).json({
       task,
+
       count: offers.length,
+
       offers,
     });
   } catch (error) {
@@ -368,18 +456,13 @@ router.get("/:taskId/offers", protect, async (req, res) => {
 
 /*
 ========================================
-ACCEPT PROVIDER OFFER
+CUSTOMER - ACCEPT OFFER
 PATCH /api/tasks/:taskId/offers/:offerId/accept
-CUSTOMER OWNER ONLY
 ========================================
 */
 
 router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
   try {
-    /*
-      GET CUSTOMER
-      */
-
     const customer = await User.findById(req.userId);
 
     if (!customer) {
@@ -394,10 +477,6 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
       });
     }
 
-    /*
-      GET TASK
-      */
-
     const task = await Task.findById(req.params.taskId);
 
     if (!task) {
@@ -406,29 +485,17 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
       });
     }
 
-    /*
-      VERIFY TASK OWNERSHIP
-      */
-
     if (task.customerId.toString() !== req.userId.toString()) {
       return res.status(403).json({
         message: "You are not authorized to manage this task.",
       });
     }
 
-    /*
-      JOB MUST STILL BE OPEN
-      */
-
     if (task.status !== "open") {
       return res.status(400).json({
         message: "This task already has a provider assigned.",
       });
     }
-
-    /*
-      FIND OFFER
-      */
 
     const offer = await Offer.findOne({
       _id: req.params.offerId,
@@ -449,7 +516,7 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
     }
 
     /*
-      ACCEPT OFFER
+      Accept winning offer
       */
 
     offer.status = "accepted";
@@ -457,7 +524,7 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
     await offer.save();
 
     /*
-      ASSIGN PROVIDER
+      Assign provider to task
       */
 
     task.assignedProviderId = offer.providerId;
@@ -467,7 +534,7 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
     await task.save();
 
     /*
-      DECLINE ALL OTHER OFFERS
+      Decline competing offers
       */
 
     await Offer.updateMany(
@@ -488,10 +555,6 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
       },
     );
 
-    /*
-      RETURN ACCEPTED OFFER
-      */
-
     await offer.populate("providerId", "fullName location services rating");
 
     return res.status(200).json({
@@ -506,12 +569,6 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
   } catch (error) {
     console.error("Accept offer error:", error);
 
-    if (error.name === "CastError") {
-      return res.status(404).json({
-        message: "Offer or task not found.",
-      });
-    }
-
     return res.status(500).json({
       message: "Server error while accepting offer.",
     });
@@ -520,9 +577,8 @@ router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
 
 /*
 ========================================
-GET MATCHING PROVIDERS
+CUSTOMER - MATCHING PROVIDERS
 GET /api/tasks/:taskId/providers
-CUSTOMER OWNER ONLY
 ========================================
 */
 
@@ -615,16 +671,19 @@ router.get("/:taskId", protect, async (req, res) => {
       */
 
     if (user.role === "provider") {
-      if (
-        task.status !== "open" &&
-        task.assignedProviderId?._id?.toString() !== req.userId.toString()
-      ) {
-        return res.status(403).json({
-          message: "This job is no longer available.",
-        });
+      const assignedProviderId = task.assignedProviderId?._id?.toString();
+
+      if (task.status === "open") {
+        return res.status(200).json(task);
       }
 
-      return res.status(200).json(task);
+      if (assignedProviderId === req.userId.toString()) {
+        return res.status(200).json(task);
+      }
+
+      return res.status(403).json({
+        message: "This job is no longer available.",
+      });
     }
 
     /*
@@ -632,9 +691,7 @@ router.get("/:taskId", protect, async (req, res) => {
       */
 
     if (user.role === "customer") {
-      const customerId = task.customerId?._id
-        ? task.customerId._id.toString()
-        : task.customerId.toString();
+      const customerId = task.customerId?._id?.toString();
 
       if (customerId !== req.userId.toString()) {
         return res.status(403).json({
@@ -650,12 +707,6 @@ router.get("/:taskId", protect, async (req, res) => {
     });
   } catch (error) {
     console.error("Load task error:", error);
-
-    if (error.name === "CastError") {
-      return res.status(404).json({
-        message: "Job not found.",
-      });
-    }
 
     return res.status(500).json({
       message: "Server error while loading job.",
