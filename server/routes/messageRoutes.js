@@ -1,8 +1,8 @@
 const express = require("express");
 
 const Message = require("../models/Message");
+
 const Task = require("../models/Task");
-const User = require("../models/User");
 
 const protect = require("../middleware/authMiddleware");
 
@@ -11,18 +11,19 @@ const router = express.Router();
 /*
 ========================================
 HELPER
-CHECK WHETHER USER BELONGS TO JOB
+CHECK TASK ACCESS
 ========================================
 */
 
 const getTaskAccess = async (taskId, userId) => {
   const task = await Task.findById(taskId)
-    .populate("customerId", "fullName email")
-    .populate("assignedProviderId", "fullName email");
+    .populate("customerId", "fullName email role")
+    .populate("assignedProviderId", "fullName email role");
 
   if (!task) {
     return {
       error: "Task not found.",
+
       status: 404,
     };
   }
@@ -40,6 +41,7 @@ const getTaskAccess = async (taskId, userId) => {
   if (!isCustomer && !isProvider) {
     return {
       error: "You are not authorized to access this conversation.",
+
       status: 403,
     };
   }
@@ -47,22 +49,27 @@ const getTaskAccess = async (taskId, userId) => {
   if (!providerId) {
     return {
       error: "A provider has not been assigned to this task.",
+
       status: 400,
     };
   }
 
   return {
     task,
-    isCustomer,
-    isProvider,
+
     customerId,
+
     providerId,
+
+    isCustomer,
+
+    isProvider,
   };
 };
 
 /*
 ========================================
-GET JOB CONVERSATION
+GET CONVERSATION
 GET /api/messages/task/:taskId
 ========================================
 */
@@ -87,8 +94,8 @@ router.get("/task/:taskId", protect, async (req, res) => {
       });
 
     /*
-      Mark messages sent TO current
-      user as read.
+      Mark messages sent to
+      current user as read.
       */
 
     await Message.updateMany(
@@ -99,6 +106,7 @@ router.get("/task/:taskId", protect, async (req, res) => {
 
         read: false,
       },
+
       {
         $set: {
           read: true,
@@ -146,8 +154,8 @@ router.post("/task/:taskId", protect, async (req, res) => {
     }
 
     /*
-      Keep chat available while
-      assigned or in progress.
+      Messaging is only available
+      while the job is active.
       */
 
     if (!["assigned", "in-progress"].includes(access.task.status)) {
@@ -160,7 +168,11 @@ router.post("/task/:taskId", protect, async (req, res) => {
       ? access.providerId
       : access.customerId;
 
-    const message = await Message.create({
+    /*
+      Save message
+      */
+
+    const newMessage = await Message.create({
       taskId: access.task._id,
 
       senderId: req.userId,
@@ -170,16 +182,33 @@ router.post("/task/:taskId", protect, async (req, res) => {
       text: text.trim(),
     });
 
-    await message.populate("senderId", "fullName role");
+    /*
+      Populate sender and receiver
+      before sending to clients.
+      */
 
-    await message.populate("receiverId", "fullName role");
+    await newMessage.populate("senderId", "fullName role");
+
+    await newMessage.populate("receiverId", "fullName role");
+
+    /*
+      ========================================
+      REAL-TIME SOCKET EVENT
+      ========================================
+      */
+
+    const io = req.app.get("io");
+
+    if (io) {
+      io.to(`task:${req.params.taskId}`).emit("new_message", newMessage);
+    }
 
     return res.status(201).json({
       success: true,
 
       message: "Message sent.",
 
-      data: message,
+      data: newMessage,
     });
   } catch (error) {
     console.error("Send message error:", error);
