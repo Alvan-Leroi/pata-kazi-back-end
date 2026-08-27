@@ -2,6 +2,7 @@ const express = require("express");
 
 const Task = require("../models/Task");
 const User = require("../models/User");
+const Offer = require("../models/Offer");
 
 const protect = require("../middleware/authMiddleware");
 
@@ -9,7 +10,7 @@ const router = express.Router();
 
 /*
 ========================================
-CREATE A TASK
+CREATE TASK
 POST /api/tasks
 CUSTOMER ONLY
 ========================================
@@ -18,12 +19,6 @@ CUSTOMER ONLY
 router.post("/", protect, async (req, res) => {
   try {
     const { title, category, description, location, budget } = req.body;
-
-    /*
-      ------------------------------------
-      VALIDATE FIELDS
-      ------------------------------------
-      */
 
     if (
       !title ||
@@ -37,12 +32,6 @@ router.post("/", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      GET LOGGED-IN USER
-      ------------------------------------
-      */
-
     const customer = await User.findById(req.userId);
 
     if (!customer) {
@@ -51,23 +40,11 @@ router.post("/", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      CUSTOMER ONLY
-      ------------------------------------
-      */
-
     if (customer.role !== "customer") {
       return res.status(403).json({
         message: "Only customers can post tasks.",
       });
     }
-
-    /*
-      ------------------------------------
-      VALIDATE BUDGET
-      ------------------------------------
-      */
 
     const numericBudget = Number(budget);
 
@@ -76,12 +53,6 @@ router.post("/", protect, async (req, res) => {
         message: "Please enter a valid budget.",
       });
     }
-
-    /*
-      ------------------------------------
-      CREATE TASK
-      ------------------------------------
-      */
 
     const task = await Task.create({
       customerId: req.userId,
@@ -115,9 +86,8 @@ router.post("/", protect, async (req, res) => {
 
 /*
 ========================================
-GET CUSTOMER'S OWN TASKS
+GET MY CUSTOMER TASKS
 GET /api/tasks/mine
-CUSTOMER ONLY
 ========================================
 */
 
@@ -163,12 +133,6 @@ PROVIDER ONLY
 
 router.get("/open", protect, async (req, res) => {
   try {
-    /*
-      ------------------------------------
-      GET PROVIDER
-      ------------------------------------
-      */
-
     const provider = await User.findById(req.userId);
 
     if (!provider) {
@@ -177,23 +141,11 @@ router.get("/open", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      PROVIDER ONLY
-      ------------------------------------
-      */
-
     if (provider.role !== "provider") {
       return res.status(403).json({
         message: "Only service providers can view open jobs.",
       });
     }
-
-    /*
-      ------------------------------------
-      FIND OPEN TASKS
-      ------------------------------------
-      */
 
     const tasks = await Task.find({
       status: "open",
@@ -215,25 +167,33 @@ router.get("/open", protect, async (req, res) => {
 
 /*
 ========================================
-GET ONE JOB / TASK
-GET /api/tasks/:taskId
-CUSTOMER OWNER OR PROVIDER
+SEND AN OFFER
+POST /api/tasks/:taskId/offers
+PROVIDER ONLY
 ========================================
 */
 
-router.get("/:taskId", protect, async (req, res) => {
+router.post("/:taskId/offers", protect, async (req, res) => {
   try {
+    const { amount, message } = req.body;
+
     /*
       ------------------------------------
-      GET LOGGED-IN USER
+      GET PROVIDER
       ------------------------------------
       */
 
-    const user = await User.findById(req.userId);
+    const provider = await User.findById(req.userId);
 
-    if (!user) {
+    if (!provider) {
       return res.status(404).json({
         message: "User not found.",
+      });
+    }
+
+    if (provider.role !== "provider") {
+      return res.status(403).json({
+        message: "Only service providers can send offers.",
       });
     }
 
@@ -243,10 +203,7 @@ router.get("/:taskId", protect, async (req, res) => {
       ------------------------------------
       */
 
-    const task = await Task.findById(req.params.taskId).populate(
-      "customerId",
-      "fullName location",
-    );
+    const task = await Task.findById(req.params.taskId);
 
     if (!task) {
       return res.status(404).json({
@@ -256,72 +213,213 @@ router.get("/:taskId", protect, async (req, res) => {
 
     /*
       ------------------------------------
-      PROVIDER ACCESS
+      CHECK JOB STATUS
       ------------------------------------
-
-      Providers can view jobs only
-      while they are available.
       */
 
-    if (user.role === "provider") {
-      if (task.status !== "open") {
-        return res.status(403).json({
-          message: "This job is no longer available.",
-        });
-      }
-
-      return res.status(200).json(task);
+    if (task.status !== "open") {
+      return res.status(400).json({
+        message: "This job is no longer accepting offers.",
+      });
     }
 
     /*
       ------------------------------------
-      CUSTOMER ACCESS
+      VALIDATE PRICE
       ------------------------------------
-
-      Customers can only view their
-      own task.
       */
 
-    if (user.role === "customer") {
-      const taskCustomerId = task.customerId?._id
-        ? task.customerId._id.toString()
-        : task.customerId.toString();
+    const offerAmount = Number(amount);
 
-      if (taskCustomerId !== req.userId.toString()) {
-        return res.status(403).json({
-          message: "You are not authorized to view this task.",
-        });
-      }
-
-      return res.status(200).json(task);
+    if (Number.isNaN(offerAmount) || offerAmount < 0) {
+      return res.status(400).json({
+        message: "Please enter a valid offer amount.",
+      });
     }
 
     /*
       ------------------------------------
-      UNKNOWN ROLE
+      VALIDATE MESSAGE
       ------------------------------------
       */
 
-    return res.status(403).json({
-      message: "You are not authorized to view this task.",
+    if (!message || !message.trim()) {
+      return res.status(400).json({
+        message: "Please include a short message for the customer.",
+      });
+    }
+
+    /*
+      ------------------------------------
+      PREVENT DUPLICATE OFFER
+      ------------------------------------
+      */
+
+    const existingOffer = await Offer.findOne({
+      taskId: task._id,
+
+      providerId: req.userId,
+    });
+
+    if (existingOffer) {
+      return res.status(400).json({
+        message: "You have already sent an offer for this job.",
+
+        offer: existingOffer,
+      });
+    }
+
+    /*
+      ------------------------------------
+      CREATE OFFER
+      ------------------------------------
+      */
+
+    const offer = await Offer.create({
+      taskId: task._id,
+
+      providerId: req.userId,
+
+      customerId: task.customerId,
+
+      amount: offerAmount,
+
+      message: message.trim(),
+
+      status: "pending",
+    });
+
+    /*
+      ------------------------------------
+      POPULATE PROVIDER
+      ------------------------------------
+      */
+
+    await offer.populate("providerId", "fullName location services rating");
+
+    return res.status(201).json({
+      success: true,
+
+      message: "Your offer has been sent to the customer.",
+
+      offer,
     });
   } catch (error) {
-    console.error("Load task error:", error);
+    console.error("Send offer error:", error);
 
-    /*
-      ------------------------------------
-      INVALID MONGODB ID
-      ------------------------------------
-      */
-
-    if (error.name === "CastError") {
-      return res.status(404).json({
-        message: "Job not found.",
+    if (error.code === 11000) {
+      return res.status(400).json({
+        message: "You have already sent an offer for this job.",
       });
     }
 
     return res.status(500).json({
-      message: "Server error while loading job.",
+      message: "Server error while sending your offer.",
+    });
+  }
+});
+
+/*
+========================================
+CHECK PROVIDER'S OFFER FOR THIS JOB
+GET /api/tasks/:taskId/my-offer
+PROVIDER ONLY
+========================================
+*/
+
+router.get("/:taskId/my-offer", protect, async (req, res) => {
+  try {
+    const provider = await User.findById(req.userId);
+
+    if (!provider) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    if (provider.role !== "provider") {
+      return res.status(403).json({
+        message: "Only service providers can view offers.",
+      });
+    }
+
+    const offer = await Offer.findOne({
+      taskId: req.params.taskId,
+
+      providerId: req.userId,
+    });
+
+    return res.status(200).json({
+      hasOffer: !!offer,
+
+      offer: offer || null,
+    });
+  } catch (error) {
+    console.error("Load provider offer error:", error);
+
+    return res.status(500).json({
+      message: "Server error while loading your offer.",
+    });
+  }
+});
+
+/*
+========================================
+GET OFFERS FOR CUSTOMER TASK
+GET /api/tasks/:taskId/offers
+CUSTOMER OWNER ONLY
+========================================
+*/
+
+router.get("/:taskId/offers", protect, async (req, res) => {
+  try {
+    const customer = await User.findById(req.userId);
+
+    if (!customer) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    if (customer.role !== "customer") {
+      return res.status(403).json({
+        message: "Only customers can view offers.",
+      });
+    }
+
+    const task = await Task.findById(req.params.taskId);
+
+    if (!task) {
+      return res.status(404).json({
+        message: "Task not found.",
+      });
+    }
+
+    if (task.customerId.toString() !== req.userId.toString()) {
+      return res.status(403).json({
+        message: "You are not authorized to view offers for this task.",
+      });
+    }
+
+    const offers = await Offer.find({
+      taskId: task._id,
+    })
+      .populate("providerId", "fullName location services rating phone")
+      .sort({
+        createdAt: -1,
+      });
+
+    return res.status(200).json({
+      task,
+      count: offers.length,
+
+      offers,
+    });
+  } catch (error) {
+    console.error("Load task offers error:", error);
+
+    return res.status(500).json({
+      message: "Server error while loading offers.",
     });
   }
 });
@@ -336,12 +434,6 @@ CUSTOMER OWNER ONLY
 
 router.get("/:taskId/providers", protect, async (req, res) => {
   try {
-    /*
-      ------------------------------------
-      GET USER
-      ------------------------------------
-      */
-
     const customer = await User.findById(req.userId);
 
     if (!customer) {
@@ -350,23 +442,11 @@ router.get("/:taskId/providers", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      CUSTOMER ONLY
-      ------------------------------------
-      */
-
     if (customer.role !== "customer") {
       return res.status(403).json({
         message: "Only customers can view matching providers.",
       });
     }
-
-    /*
-      ------------------------------------
-      FIND TASK
-      ------------------------------------
-      */
 
     const task = await Task.findById(req.params.taskId);
 
@@ -376,23 +456,11 @@ router.get("/:taskId/providers", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      VERIFY OWNERSHIP
-      ------------------------------------
-      */
-
     if (task.customerId.toString() !== req.userId.toString()) {
       return res.status(403).json({
         message: "You are not authorized to view providers for this task.",
       });
     }
-
-    /*
-      ------------------------------------
-      FIND MATCHING PROVIDERS
-      ------------------------------------
-      */
 
     const providers = await User.find({
       role: "provider",
@@ -408,12 +476,6 @@ router.get("/:taskId/providers", protect, async (req, res) => {
       },
     }).select("fullName email phone location services rating");
 
-    /*
-      ------------------------------------
-      RETURN MATCHES
-      ------------------------------------
-      */
-
     return res.status(200).json({
       task,
       providers,
@@ -421,14 +483,89 @@ router.get("/:taskId/providers", protect, async (req, res) => {
   } catch (error) {
     console.error("Provider search error:", error);
 
+    return res.status(500).json({
+      message: "Server error while searching providers.",
+    });
+  }
+});
+
+/*
+========================================
+GET ONE JOB
+GET /api/tasks/:taskId
+========================================
+*/
+
+router.get("/:taskId", protect, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+
+    if (!user) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    const task = await Task.findById(req.params.taskId).populate(
+      "customerId",
+      "fullName location",
+    );
+
+    if (!task) {
+      return res.status(404).json({
+        message: "Job not found.",
+      });
+    }
+
+    /*
+      PROVIDER
+      */
+
+    if (user.role === "provider") {
+      if (
+        task.status !== "open" &&
+        task.assignedProviderId?.toString() !== req.userId.toString()
+      ) {
+        return res.status(403).json({
+          message: "This job is no longer available.",
+        });
+      }
+
+      return res.status(200).json(task);
+    }
+
+    /*
+      CUSTOMER
+      */
+
+    if (user.role === "customer") {
+      const customerId = task.customerId?._id
+        ? task.customerId._id.toString()
+        : task.customerId.toString();
+
+      if (customerId !== req.userId.toString()) {
+        return res.status(403).json({
+          message: "You are not authorized to view this task.",
+        });
+      }
+
+      return res.status(200).json(task);
+    }
+
+    return res.status(403).json({
+      message: "Not authorized.",
+    });
+  } catch (error) {
+    console.error("Load task error:", error);
+
     if (error.name === "CastError") {
       return res.status(404).json({
-        message: "Task not found.",
+        message: "Job not found.",
       });
     }
 
     return res.status(500).json({
-      message: "Server error while searching providers.",
+      message: "Server error while loading job.",
     });
   }
 });
