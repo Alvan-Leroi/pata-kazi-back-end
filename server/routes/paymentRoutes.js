@@ -3,6 +3,7 @@ const express = require("express");
 const Task = require("../models/Task");
 const Offer = require("../models/Offer");
 const Payment = require("../models/Payment");
+const User = require("../models/User");
 
 const protect = require("../middleware/authMiddleware");
 
@@ -22,12 +23,36 @@ const getMpesaBaseUrl = () => {
   return "https://sandbox.safaricom.co.ke";
 };
 
+/*
+========================================
+NORMALIZE KENYAN PHONE NUMBER
+
+Examples:
+
+0712345678
+    ↓
+254712345678
+
++254712345678
+    ↓
+254712345678
+
+254712345678
+    ↓
+254712345678
+========================================
+*/
+
 const normalizePhoneNumber = (phoneNumber) => {
   if (!phoneNumber) {
     return null;
   }
 
-  let clean = phoneNumber.toString().replace(/\s+/g, "").replace(/-/g, "");
+  let clean = phoneNumber
+    .toString()
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/-/g, "");
 
   if (clean.startsWith("+254")) {
     clean = clean.substring(1);
@@ -37,11 +62,7 @@ const normalizePhoneNumber = (phoneNumber) => {
     clean = `254${clean.substring(1)}`;
   }
 
-  if (clean.startsWith("7")) {
-    clean = `254${clean}`;
-  }
-
-  if (clean.startsWith("1")) {
+  if (clean.startsWith("7") || clean.startsWith("1")) {
     clean = `254${clean}`;
   }
 
@@ -51,6 +72,13 @@ const normalizePhoneNumber = (phoneNumber) => {
 
   return clean;
 };
+
+/*
+========================================
+CREATE M-PESA TIMESTAMP
+YYYYMMDDHHMMSS
+========================================
+*/
 
 const createTimestamp = () => {
   const now = new Date();
@@ -66,6 +94,12 @@ const createTimestamp = () => {
     pad(now.getSeconds())
   );
 };
+
+/*
+========================================
+GET M-PESA ACCESS TOKEN
+========================================
+*/
 
 const getMpesaAccessToken = async () => {
   const consumerKey = process.env.MPESA_CONSUMER_KEY;
@@ -106,7 +140,7 @@ const getMpesaAccessToken = async () => {
   }
 
   if (!response.ok || !data.access_token) {
-    console.error("M-PESA auth response:", data);
+    console.error("M-PESA authorization response:", data);
 
     throw new Error(
       data.errorMessage ||
@@ -117,6 +151,12 @@ const getMpesaAccessToken = async () => {
 
   return data.access_token;
 };
+
+/*
+========================================
+CALLBACK METADATA HELPER
+========================================
+*/
 
 const getCallbackMetadata = (callback) => {
   const metadataItems = callback?.CallbackMetadata?.Item || [];
@@ -134,10 +174,19 @@ const getCallbackMetadata = (callback) => {
 
 /*
 ========================================
-START M-PESA PAYMENT
+START M-PESA STK PUSH
 
 POST
 /api/payments/mpesa/stk-push
+
+IMPORTANT:
+
+We DO NOT trust a provider phone
+or random client-side account value.
+
+We load the currently authenticated
+CUSTOMER from MongoDB and use that
+customer's saved phone number.
 ========================================
 */
 
@@ -145,21 +194,54 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
   let createdPayment = null;
 
   try {
-    const { taskId, phoneNumber } = req.body;
+    const { taskId } = req.body;
 
-    if (!taskId || !phoneNumber) {
+    if (!taskId) {
       return res.status(400).json({
-        message: "Task ID and phone number are required.",
+        message: "Task ID is required.",
       });
     }
 
-    const normalizedPhone = normalizePhoneNumber(phoneNumber);
+    /*
+      ========================================
+      LOAD LOGGED-IN CUSTOMER
+      ========================================
+      */
+
+    const customer = await User.findById(req.userId);
+
+    if (!customer) {
+      return res.status(404).json({
+        message: "Customer account could not be found.",
+      });
+    }
+
+    if (customer.role !== "customer") {
+      return res.status(403).json({
+        message: "Only customers can make payments.",
+      });
+    }
+
+    /*
+      ========================================
+      CUSTOMER PHONE NUMBER
+      ========================================
+      */
+
+    const normalizedPhone = normalizePhoneNumber(customer.phone);
 
     if (!normalizedPhone) {
       return res.status(400).json({
-        message: "Enter a valid Kenyan phone number, for example 0712345678.",
+        message:
+          "Your Pata Kazi account does not have a valid Kenyan phone number. Please update your customer phone number before paying.",
       });
     }
+
+    /*
+      ========================================
+      LOAD TASK
+      ========================================
+      */
 
     const task = await Task.findById(taskId);
 
@@ -170,21 +252,34 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
     }
 
     /*
-      Only the customer who owns
-      the task may initiate payment.
+      ========================================
+      VERIFY CUSTOMER OWNS TASK
+      ========================================
       */
 
-    if (task.customerId.toString() !== req.userId.toString()) {
+    if (task.customerId.toString() !== customer._id.toString()) {
       return res.status(403).json({
         message: "You are not authorized to pay for this task.",
       });
     }
+
+    /*
+      ========================================
+      VERIFY ACTIVE JOB
+      ========================================
+      */
 
     if (!["assigned", "in-progress"].includes(task.status)) {
       return res.status(400).json({
         message: "Payment is only available for an assigned active job.",
       });
     }
+
+    /*
+      ========================================
+      VERIFY PROVIDER EXISTS
+      ========================================
+      */
 
     if (!task.assignedProviderId) {
       return res.status(400).json({
@@ -193,11 +288,9 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
     }
 
     /*
-      Get the accepted offer.
-
-      Payment uses the ACCEPTED
-      OFFER amount, not the original
-      task budget.
+      ========================================
+      GET ACCEPTED OFFER
+      ========================================
       */
 
     const acceptedOffer = await Offer.findOne({
@@ -214,6 +307,12 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       });
     }
 
+    /*
+      ========================================
+      USE ACCEPTED OFFER PRICE
+      ========================================
+      */
+
     const amount = Math.round(Number(acceptedOffer.amount));
 
     if (!amount || amount < 1) {
@@ -223,8 +322,9 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
     }
 
     /*
-      Prevent another payment if
-      this task is already paid.
+      ========================================
+      PREVENT DUPLICATE PAID PAYMENT
+      ========================================
       */
 
     const existingPaidPayment = await Payment.findOne({
@@ -240,23 +340,34 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
     }
 
     /*
-      Create local pending
-      transaction first.
+      ========================================
+      CREATE LOCAL PAYMENT
+      ========================================
       */
 
     createdPayment = await Payment.create({
       taskId: task._id,
 
-      customerId: task.customerId,
+      customerId: customer._id,
 
       providerId: task.assignedProviderId,
 
       amount,
 
+      /*
+          THIS IS THE CUSTOMER NUMBER
+          */
+
       phoneNumber: normalizedPhone,
 
       status: "pending",
     });
+
+    /*
+      ========================================
+      M-PESA ENVIRONMENT
+      ========================================
+      */
 
     const shortcode = process.env.MPESA_SHORTCODE;
 
@@ -268,17 +379,48 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       throw new Error("M-PESA shortcode, passkey, or callback URL is missing.");
     }
 
+    /*
+      ========================================
+      CREATE PASSWORD
+      ========================================
+      */
+
     const timestamp = createTimestamp();
 
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString(
       "base64",
     );
 
+    /*
+      ========================================
+      ACCESS TOKEN
+      ========================================
+      */
+
     const accessToken = await getMpesaAccessToken();
 
     const baseUrl = getMpesaBaseUrl();
 
+    /*
+      ========================================
+      ACCOUNT REFERENCE
+      ========================================
+      */
+
     const accountReference = `PK-${task._id.toString().slice(-8)}`;
+
+    /*
+      ========================================
+      M-PESA REQUEST
+      ========================================
+
+      PartyA       = CUSTOMER
+      PhoneNumber  = CUSTOMER
+      PartyB       = BUSINESS SHORTCODE
+
+      Provider number is NOT used here.
+      ========================================
+      */
 
     const requestBody = {
       BusinessShortCode: shortcode,
@@ -304,12 +446,25 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       TransactionDesc: "Pata Kazi service payment",
     };
 
+    /*
+      Safe debug information.
+
+      We log whose payment it is
+      without exposing credentials.
+      */
+
     console.log("Sending M-PESA STK Push:", {
       taskId: task._id.toString(),
 
-      amount,
+      customerId: customer._id.toString(),
 
-      phoneNumber: normalizedPhone,
+      customerName: customer.fullName,
+
+      customerPhone: normalizedPhone,
+
+      providerId: task.assignedProviderId.toString(),
+
+      amount,
 
       accountReference,
     });
@@ -341,6 +496,12 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     console.log("M-PESA STK Push response:", mpesaData);
 
+    /*
+      ========================================
+      HANDLE REJECTION
+      ========================================
+      */
+
     if (!mpesaResponse.ok || mpesaData.ResponseCode !== "0") {
       createdPayment.status = "failed";
 
@@ -358,6 +519,12 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       });
     }
 
+    /*
+      ========================================
+      SAVE M-PESA IDS
+      ========================================
+      */
+
     createdPayment.merchantRequestId = mpesaData.MerchantRequestID || "";
 
     createdPayment.checkoutRequestId = mpesaData.CheckoutRequestID || "";
@@ -367,10 +534,16 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     await createdPayment.save();
 
+    /*
+      ========================================
+      RESPONSE TO FRONTEND
+      ========================================
+      */
+
     return res.status(200).json({
       success: true,
 
-      message: "M-PESA payment request sent to the phone.",
+      message: "M-PESA payment request sent to your phone.",
 
       paymentId: createdPayment._id,
 
@@ -404,21 +577,15 @@ M-PESA CALLBACK
 POST
 /api/payments/mpesa/callback
 
-IMPORTANT:
-Do NOT add auth middleware here.
+NO JWT AUTH HERE.
 
-Safaricom must be able to reach
-this endpoint directly.
+Safaricom needs public access
+to this URL.
 ========================================
 */
 
 router.post("/mpesa/callback", async (req, res) => {
   try {
-    /*
-      Immediately inspect the
-      callback Safaricom sent.
-      */
-
     console.log("M-PESA callback received:");
 
     console.log(JSON.stringify(req.body, null, 2));
@@ -427,12 +594,6 @@ router.post("/mpesa/callback", async (req, res) => {
 
     if (!callback) {
       console.warn("Invalid M-PESA callback body.");
-
-      /*
-        Still return 200 so the
-        callback endpoint itself
-        remains reachable.
-        */
 
       return res.status(200).json({
         ResultCode: 0,
@@ -450,8 +611,9 @@ router.post("/mpesa/callback", async (req, res) => {
     const resultDescription = callback.ResultDesc || "";
 
     /*
-      Locate the pending payment
-      created during STK Push.
+      ========================================
+      FIND PAYMENT
+      ========================================
       */
 
     const payment = await Payment.findOne({
@@ -469,6 +631,7 @@ router.post("/mpesa/callback", async (req, res) => {
     if (!payment) {
       console.warn("No local payment matched callback:", {
         checkoutRequestId,
+
         merchantRequestId,
       });
 
@@ -486,8 +649,9 @@ router.post("/mpesa/callback", async (req, res) => {
     payment.rawCallback = req.body;
 
     /*
-      ResultCode 0 means payment
-      completed successfully.
+      ========================================
+      SUCCESS
+      ========================================
       */
 
     if (resultCode === 0) {
@@ -512,8 +676,8 @@ router.post("/mpesa/callback", async (req, res) => {
       console.log(`Payment ${payment._id} marked PAID`);
     } else {
       /*
-        Examples include customer
-        cancellation or failed PIN.
+        Result 1032 is commonly
+        customer cancellation.
         */
 
       payment.status = resultCode === 1032 ? "cancelled" : "failed";
@@ -524,15 +688,15 @@ router.post("/mpesa/callback", async (req, res) => {
     await payment.save();
 
     /*
-      Notify frontend clients
-      through the Socket.IO server
-      we already use for chat.
+      ========================================
+      REAL-TIME PAYMENT EVENT
+      ========================================
       */
 
     const io = req.app.get("io");
 
     if (io) {
-      io.emit("payment_updated", {
+      io.to(`user:${payment.customerId}`).emit("payment_updated", {
         paymentId: payment._id,
 
         taskId: payment.taskId,
@@ -545,10 +709,6 @@ router.post("/mpesa/callback", async (req, res) => {
       });
     }
 
-    /*
-      Acknowledge callback.
-      */
-
     return res.status(200).json({
       ResultCode: 0,
 
@@ -556,10 +716,6 @@ router.post("/mpesa/callback", async (req, res) => {
     });
   } catch (error) {
     console.error("M-PESA callback error:", error);
-
-    /*
-      Keep endpoint responsive.
-      */
 
     return res.status(200).json({
       ResultCode: 0,
@@ -571,7 +727,7 @@ router.post("/mpesa/callback", async (req, res) => {
 
 /*
 ========================================
-CHECK PAYMENT STATUS
+GET PAYMENT STATUS
 
 GET
 /api/payments/task/:taskId

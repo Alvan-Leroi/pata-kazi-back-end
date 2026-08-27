@@ -41,7 +41,7 @@ const messageRoutes =
 
 const paymentRoutes =
   require(
-    "./routes/payment"
+    "./routes/paymentRoutes"
   );
 
 const Task =
