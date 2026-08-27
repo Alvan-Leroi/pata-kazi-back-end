@@ -23,6 +23,21 @@ const getMpesaBaseUrl = () => {
   return "https://sandbox.safaricom.co.ke";
 };
 
+/*
+========================================
+NORMALIZE KENYAN PHONE NUMBER
+
+0712345678
+→ 254712345678
+
++254712345678
+→ 254712345678
+
+254712345678
+→ 254712345678
+========================================
+*/
+
 const normalizePhoneNumber = (phoneNumber) => {
   if (!phoneNumber) {
     return null;
@@ -53,6 +68,12 @@ const normalizePhoneNumber = (phoneNumber) => {
   return clean;
 };
 
+/*
+========================================
+TIMESTAMP
+========================================
+*/
+
 const createTimestamp = () => {
   const now = new Date();
 
@@ -67,6 +88,12 @@ const createTimestamp = () => {
     pad(now.getSeconds())
   );
 };
+
+/*
+========================================
+ACCESS TOKEN
+========================================
+*/
 
 const getMpesaAccessToken = async () => {
   const consumerKey = process.env.MPESA_CONSUMER_KEY;
@@ -119,6 +146,12 @@ const getMpesaAccessToken = async () => {
   return data.access_token;
 };
 
+/*
+========================================
+CALLBACK METADATA
+========================================
+*/
+
 const getCallbackMetadata = (callback) => {
   const items = callback?.CallbackMetadata?.Item || [];
 
@@ -135,27 +168,21 @@ const getCallbackMetadata = (callback) => {
 
 /*
 ========================================
-REQUEST CUSTOMER PAYMENT
+REQUEST PAYMENT
 
 POST
 /api/payments/mpesa/stk-push
 
-IMPORTANT FLOW:
+Provider supplies:
 
-Logged-in user:
-PROVIDER
+{
+  taskId,
+  phoneNumber
+}
 
-STK recipient:
-CUSTOMER
+Provider initiates request.
 
-The provider initiates the payment
-request.
-
-The backend fetches the customer's
-phone number from MongoDB.
-
-The provider never types or controls
-the customer's phone number.
+STK Push goes to the entered number.
 ========================================
 */
 
@@ -163,11 +190,31 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
   let createdPayment = null;
 
   try {
-    const { taskId } = req.body;
+    const { taskId, phoneNumber } = req.body;
+
+    /*
+      ========================================
+      VALIDATE INPUT
+      ========================================
+      */
 
     if (!taskId) {
       return res.status(400).json({
         message: "Task ID is required.",
+      });
+    }
+
+    if (!phoneNumber) {
+      return res.status(400).json({
+        message: "Enter the M-PESA phone number.",
+      });
+    }
+
+    const normalizedPhone = normalizePhoneNumber(phoneNumber);
+
+    if (!normalizedPhone) {
+      return res.status(400).json({
+        message: "Enter a valid Kenyan phone number, for example 0712345678.",
       });
     }
 
@@ -193,7 +240,7 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     /*
       ========================================
-      LOAD TASK + CUSTOMER
+      LOAD TASK
       ========================================
       */
 
@@ -210,7 +257,7 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     /*
       ========================================
-      VERIFY PROVIDER IS ASSIGNED
+      VERIFY ASSIGNED PROVIDER
       ========================================
       */
 
@@ -252,15 +299,6 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       });
     }
 
-    const customerPhone = normalizePhoneNumber(customer.phone);
-
-    if (!customerPhone) {
-      return res.status(400).json({
-        message:
-          "The customer does not have a valid Kenyan phone number saved.",
-      });
-    }
-
     /*
       ========================================
       GET ACCEPTED OFFER
@@ -281,6 +319,12 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       });
     }
 
+    /*
+      ========================================
+      PAYMENT AMOUNT
+      ========================================
+      */
+
     const amount = Math.round(Number(acceptedOffer.amount));
 
     if (!amount || amount < 1) {
@@ -291,7 +335,7 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     /*
       ========================================
-      PREVENT DUPLICATE PAID PAYMENT
+      ALREADY PAID?
       ========================================
       */
 
@@ -309,7 +353,14 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     /*
       ========================================
-      PREVENT MULTIPLE ACTIVE STK REQUESTS
+      PREVIOUS PENDING PAYMENT
+
+      Allow another request only if
+      there isn't already a live pending
+      transaction.
+
+      During testing, failed/cancelled
+      ones will not block a retry.
       ========================================
       */
 
@@ -340,7 +391,12 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
       amount,
 
-      phoneNumber: customerPhone,
+      /*
+          This is the number the provider
+          entered on the payment form.
+          */
+
+      phoneNumber: normalizedPhone,
 
       status: "pending",
     });
@@ -361,11 +417,23 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       throw new Error("M-PESA shortcode, passkey, or callback URL is missing.");
     }
 
+    /*
+      ========================================
+      PASSWORD
+      ========================================
+      */
+
     const timestamp = createTimestamp();
 
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString(
       "base64",
     );
+
+    /*
+      ========================================
+      TOKEN
+      ========================================
+      */
 
     const accessToken = await getMpesaAccessToken();
 
@@ -377,8 +445,9 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
       ========================================
       STK PUSH
 
-      CUSTOMER receives prompt.
-      PROVIDER initiated request.
+      PartyA = entered phone
+
+      PhoneNumber = entered phone
       ========================================
       */
 
@@ -393,11 +462,11 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
       Amount: amount,
 
-      PartyA: customerPhone,
+      PartyA: normalizedPhone,
 
       PartyB: shortcode,
 
-      PhoneNumber: customerPhone,
+      PhoneNumber: normalizedPhone,
 
       CallBackURL: callbackUrl,
 
@@ -417,10 +486,16 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
       customerName: customer.fullName,
 
-      customerPhone,
+      enteredPhone: normalizedPhone,
 
       amount,
     });
+
+    /*
+      ========================================
+      SEND TO SAFARICOM
+      ========================================
+      */
 
     const mpesaResponse = await fetch(
       `${baseUrl}/mpesa/stkpush/v1/processrequest`,
@@ -449,6 +524,12 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
     console.log("M-PESA STK Push response:", mpesaData);
 
+    /*
+      ========================================
+      REJECTED
+      ========================================
+      */
+
     if (!mpesaResponse.ok || mpesaData.ResponseCode !== "0") {
       createdPayment.status = "failed";
 
@@ -463,6 +544,12 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
         message: createdPayment.resultDescription,
       });
     }
+
+    /*
+      ========================================
+      SAVE M-PESA IDS
+      ========================================
+      */
 
     createdPayment.merchantRequestId = mpesaData.MerchantRequestID || "";
 
@@ -482,11 +569,6 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
     const io = req.app.get("io");
 
     if (io) {
-      /*
-        Tell customer that provider
-        requested payment.
-        */
-
       io.to(`user:${customer._id}`).emit("payment_requested", {
         paymentId: createdPayment._id,
 
@@ -498,13 +580,10 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
         amount,
 
+        phoneNumber: normalizedPhone,
+
         status: "pending",
       });
-
-      /*
-        Provider receives confirmation
-        that request was sent.
-        */
 
       io.to(`user:${provider._id}`).emit("payment_request_sent", {
         paymentId: createdPayment._id,
@@ -515,14 +594,22 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
         amount,
 
+        phoneNumber: normalizedPhone,
+
         status: "pending",
       });
     }
 
+    /*
+      ========================================
+      RESPONSE
+      ========================================
+      */
+
     return res.status(200).json({
       success: true,
 
-      message: "Payment request sent to the customer.",
+      message: "Payment request sent.",
 
       paymentId: createdPayment._id,
 
@@ -532,9 +619,9 @@ router.post("/mpesa/stk-push", protect, async (req, res) => {
 
       customerName: customer.fullName,
 
-      customerPhone: customerPhone,
+      phoneNumber: normalizedPhone,
 
-      status: createdPayment.status,
+      status: "pending",
     });
   } catch (error) {
     console.error("M-PESA STK Push error:", error);
@@ -614,6 +701,12 @@ router.post("/mpesa/callback", async (req, res) => {
 
     payment.rawCallback = req.body;
 
+    /*
+      ========================================
+      SUCCESS
+      ========================================
+      */
+
     if (resultCode === 0) {
       const metadata = getCallbackMetadata(callback);
 
@@ -640,7 +733,7 @@ router.post("/mpesa/callback", async (req, res) => {
 
     /*
       ========================================
-      NOTIFY BOTH CUSTOMER + PROVIDER
+      REAL-TIME UPDATE
       ========================================
       */
 
@@ -654,6 +747,8 @@ router.post("/mpesa/callback", async (req, res) => {
       status: payment.status,
 
       amount: payment.amount,
+
+      phoneNumber: payment.phoneNumber,
 
       mpesaReceiptNumber: payment.mpesaReceiptNumber,
     };
