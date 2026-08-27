@@ -56,23 +56,16 @@ router.post("/", protect, async (req, res) => {
 
     const task = await Task.create({
       customerId: req.userId,
-
       title: title.trim(),
-
       category: category.trim(),
-
       description: description.trim(),
-
       location: location.trim(),
-
       budget: numericBudget,
     });
 
     return res.status(201).json({
       success: true,
-
       message: "Task created successfully.",
-
       task,
     });
   } catch (error) {
@@ -86,8 +79,9 @@ router.post("/", protect, async (req, res) => {
 
 /*
 ========================================
-GET MY CUSTOMER TASKS
+GET CUSTOMER'S TASKS
 GET /api/tasks/mine
+CUSTOMER ONLY
 ========================================
 */
 
@@ -167,7 +161,7 @@ router.get("/open", protect, async (req, res) => {
 
 /*
 ========================================
-SEND AN OFFER
+SEND OFFER
 POST /api/tasks/:taskId/offers
 PROVIDER ONLY
 ========================================
@@ -176,12 +170,6 @@ PROVIDER ONLY
 router.post("/:taskId/offers", protect, async (req, res) => {
   try {
     const { amount, message } = req.body;
-
-    /*
-      ------------------------------------
-      GET PROVIDER
-      ------------------------------------
-      */
 
     const provider = await User.findById(req.userId);
 
@@ -197,12 +185,6 @@ router.post("/:taskId/offers", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      FIND TASK
-      ------------------------------------
-      */
-
     const task = await Task.findById(req.params.taskId);
 
     if (!task) {
@@ -211,37 +193,19 @@ router.post("/:taskId/offers", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      CHECK JOB STATUS
-      ------------------------------------
-      */
-
     if (task.status !== "open") {
       return res.status(400).json({
         message: "This job is no longer accepting offers.",
       });
     }
 
-    /*
-      ------------------------------------
-      VALIDATE PRICE
-      ------------------------------------
-      */
-
     const offerAmount = Number(amount);
 
-    if (Number.isNaN(offerAmount) || offerAmount < 0) {
+    if (Number.isNaN(offerAmount) || offerAmount <= 0) {
       return res.status(400).json({
         message: "Please enter a valid offer amount.",
       });
     }
-
-    /*
-      ------------------------------------
-      VALIDATE MESSAGE
-      ------------------------------------
-      */
 
     if (!message || !message.trim()) {
       return res.status(400).json({
@@ -249,31 +213,17 @@ router.post("/:taskId/offers", protect, async (req, res) => {
       });
     }
 
-    /*
-      ------------------------------------
-      PREVENT DUPLICATE OFFER
-      ------------------------------------
-      */
-
     const existingOffer = await Offer.findOne({
       taskId: task._id,
-
       providerId: req.userId,
     });
 
     if (existingOffer) {
       return res.status(400).json({
         message: "You have already sent an offer for this job.",
-
         offer: existingOffer,
       });
     }
-
-    /*
-      ------------------------------------
-      CREATE OFFER
-      ------------------------------------
-      */
 
     const offer = await Offer.create({
       taskId: task._id,
@@ -288,12 +238,6 @@ router.post("/:taskId/offers", protect, async (req, res) => {
 
       status: "pending",
     });
-
-    /*
-      ------------------------------------
-      POPULATE PROVIDER
-      ------------------------------------
-      */
 
     await offer.populate("providerId", "fullName location services rating");
 
@@ -321,7 +265,7 @@ router.post("/:taskId/offers", protect, async (req, res) => {
 
 /*
 ========================================
-CHECK PROVIDER'S OFFER FOR THIS JOB
+GET PROVIDER'S OFFER
 GET /api/tasks/:taskId/my-offer
 PROVIDER ONLY
 ========================================
@@ -351,7 +295,6 @@ router.get("/:taskId/my-offer", protect, async (req, res) => {
 
     return res.status(200).json({
       hasOffer: !!offer,
-
       offer: offer || null,
     });
   } catch (error) {
@@ -404,7 +347,7 @@ router.get("/:taskId/offers", protect, async (req, res) => {
     const offers = await Offer.find({
       taskId: task._id,
     })
-      .populate("providerId", "fullName location services rating phone")
+      .populate("providerId", "fullName location services rating")
       .sort({
         createdAt: -1,
       });
@@ -412,7 +355,6 @@ router.get("/:taskId/offers", protect, async (req, res) => {
     return res.status(200).json({
       task,
       count: offers.length,
-
       offers,
     });
   } catch (error) {
@@ -420,6 +362,158 @@ router.get("/:taskId/offers", protect, async (req, res) => {
 
     return res.status(500).json({
       message: "Server error while loading offers.",
+    });
+  }
+});
+
+/*
+========================================
+ACCEPT PROVIDER OFFER
+PATCH /api/tasks/:taskId/offers/:offerId/accept
+CUSTOMER OWNER ONLY
+========================================
+*/
+
+router.patch("/:taskId/offers/:offerId/accept", protect, async (req, res) => {
+  try {
+    /*
+      GET CUSTOMER
+      */
+
+    const customer = await User.findById(req.userId);
+
+    if (!customer) {
+      return res.status(404).json({
+        message: "User not found.",
+      });
+    }
+
+    if (customer.role !== "customer") {
+      return res.status(403).json({
+        message: "Only customers can accept offers.",
+      });
+    }
+
+    /*
+      GET TASK
+      */
+
+    const task = await Task.findById(req.params.taskId);
+
+    if (!task) {
+      return res.status(404).json({
+        message: "Task not found.",
+      });
+    }
+
+    /*
+      VERIFY TASK OWNERSHIP
+      */
+
+    if (task.customerId.toString() !== req.userId.toString()) {
+      return res.status(403).json({
+        message: "You are not authorized to manage this task.",
+      });
+    }
+
+    /*
+      JOB MUST STILL BE OPEN
+      */
+
+    if (task.status !== "open") {
+      return res.status(400).json({
+        message: "This task already has a provider assigned.",
+      });
+    }
+
+    /*
+      FIND OFFER
+      */
+
+    const offer = await Offer.findOne({
+      _id: req.params.offerId,
+
+      taskId: task._id,
+    });
+
+    if (!offer) {
+      return res.status(404).json({
+        message: "Offer not found.",
+      });
+    }
+
+    if (offer.status !== "pending") {
+      return res.status(400).json({
+        message: "This offer is no longer pending.",
+      });
+    }
+
+    /*
+      ACCEPT OFFER
+      */
+
+    offer.status = "accepted";
+
+    await offer.save();
+
+    /*
+      ASSIGN PROVIDER
+      */
+
+    task.assignedProviderId = offer.providerId;
+
+    task.status = "assigned";
+
+    await task.save();
+
+    /*
+      DECLINE ALL OTHER OFFERS
+      */
+
+    await Offer.updateMany(
+      {
+        taskId: task._id,
+
+        _id: {
+          $ne: offer._id,
+        },
+
+        status: "pending",
+      },
+
+      {
+        $set: {
+          status: "declined",
+        },
+      },
+    );
+
+    /*
+      RETURN ACCEPTED OFFER
+      */
+
+    await offer.populate("providerId", "fullName location services rating");
+
+    return res.status(200).json({
+      success: true,
+
+      message: "Provider selected successfully.",
+
+      task,
+
+      offer,
+    });
+  } catch (error) {
+    console.error("Accept offer error:", error);
+
+    if (error.name === "CastError") {
+      return res.status(404).json({
+        message: "Offer or task not found.",
+      });
+    }
+
+    return res.status(500).json({
+      message: "Server error while accepting offer.",
     });
   }
 });
@@ -491,7 +585,7 @@ router.get("/:taskId/providers", protect, async (req, res) => {
 
 /*
 ========================================
-GET ONE JOB
+GET ONE TASK
 GET /api/tasks/:taskId
 ========================================
 */
@@ -506,10 +600,9 @@ router.get("/:taskId", protect, async (req, res) => {
       });
     }
 
-    const task = await Task.findById(req.params.taskId).populate(
-      "customerId",
-      "fullName location",
-    );
+    const task = await Task.findById(req.params.taskId)
+      .populate("customerId", "fullName location")
+      .populate("assignedProviderId", "fullName location services rating");
 
     if (!task) {
       return res.status(404).json({
@@ -518,13 +611,13 @@ router.get("/:taskId", protect, async (req, res) => {
     }
 
     /*
-      PROVIDER
+      PROVIDER ACCESS
       */
 
     if (user.role === "provider") {
       if (
         task.status !== "open" &&
-        task.assignedProviderId?.toString() !== req.userId.toString()
+        task.assignedProviderId?._id?.toString() !== req.userId.toString()
       ) {
         return res.status(403).json({
           message: "This job is no longer available.",
@@ -535,7 +628,7 @@ router.get("/:taskId", protect, async (req, res) => {
     }
 
     /*
-      CUSTOMER
+      CUSTOMER ACCESS
       */
 
     if (user.role === "customer") {
